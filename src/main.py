@@ -139,6 +139,34 @@ def agent_argv(argv):
     return argv
 
 
+def claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def claude_live_session(pid):
+    """The session id a running claude process is on RIGHT NOW, or None.
+
+    The argv `--resume <uuid>` only says which session the process was started
+    with; /clear, /resume or a plain `claude` launch move it to another session
+    while argv stays the same. Claude Code keeps `<config>/sessions/<pid>.json`
+    with the live sessionId, so prefer that. Only trust it once the transcript
+    exists — `claude --resume` on a session with no transcript fails.
+    """
+    if not pid:
+        return None
+    try:
+        with open(claude_config_dir() / "sessions" / f"{pid}.json", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    session_id = data.get("sessionId") if isinstance(data, dict) else None
+    if not session_id:
+        return None
+    if not any((claude_config_dir() / "projects").glob(f"*/{session_id}.jsonl")):
+        return None
+    return session_id
+
+
 def session_from_process_info(pane_id, agent=None):
     """Derive {agent, value} from the pane's LIVE process argv.
 
@@ -160,6 +188,10 @@ def session_from_process_info(pane_id, agent=None):
         name = os.path.basename(str(argv[0]))
         if agent and name != agent:
             continue
+        if name == "claude":
+            live = claude_live_session(proc.get("pid"))
+            if live:
+                return {"agent": name, "kind": "id", "value": live, "source": "claude-sessions"}
         flag = resume_flag_for(name)
         if not flag:
             continue
