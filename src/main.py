@@ -18,6 +18,11 @@ process dies inside a RUNNING server. This plugin covers both:
                                 the first live one, else a new workspace) and
                                 resumes the agent into it instead of giving up.
 
+Fork behavior: only agents killed by a server going down are resumed. An
+agent the user quits (or that crashes) inside a running server is left alone:
+the registry records when each agent was last seen alive (`alive_at`), and
+anything alive after the current server started is treated as a quit.
+
 Agent-agnostic: the resume command comes from a per-agent table matching
 herdr's native restore commands (claude, hermes, codex, pi, opencode, ...),
 overridable via config.json.
@@ -40,6 +45,8 @@ Conventions
   plugin is inert.
 """
 
+import contextlib
+import fcntl
 import json
 import os
 import shlex
@@ -408,6 +415,7 @@ def load_config():
         "connect_grace_seconds": int(config.get("connect_grace_seconds", 10)),
         "sweep_seconds": int(config.get("sweep_seconds", 60)),
         "pane_gone_grace_seconds": int(config.get("pane_gone_grace_seconds", 120)),
+        "quit_confirm_seconds": int(config.get("quit_confirm_seconds", 10)),
         "commands": {**DEFAULT_COMMANDS, **config.get("commands", {})},
         "require_env": _env_names(config.get("require_env")),
     }
@@ -508,6 +516,15 @@ def load_registry():
         return {}
 
 
+@contextlib.contextmanager
+def registry_lock():
+    """Serialize registry read-modify-write across monitors (one per pane)."""
+    state_dir().mkdir(parents=True, exist_ok=True)
+    with open(state_dir() / "registry.lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
 def save_registry(registry):
     state_dir().mkdir(parents=True, exist_ok=True)
     tmp = state_dir() / "registry.json.tmp"
@@ -522,25 +539,70 @@ def remember_session(pane):
     Live agent_session first (newer builds); falls back to deriving the ref
     from the pane's live process argv (builds like brew 0.8.0 that never
     expose agent_session). Without the fallback those builds supervise nothing.
+
+    Only written while the agent is alive: `alive_at` is what tells a server
+    restart (resume) apart from the user quitting (leave it alone).
     """
+    pane_id = pane["pane_id"]
     session = pane.get("agent_session") or {}
-    if not session.get("agent") or not session.get("value"):
-        derived = session_from_process_info(pane.get("pane_id"), pane.get("agent"))
-        if derived:
-            session = derived
+    if session.get("agent") and session.get("value"):
+        # agent_session can outlive the agent; process-info proves liveness.
+        if not pane_has_running_process(pane_id):
+            return False
+    else:
+        session = session_from_process_info(pane_id, pane.get("agent")) or {}
     if not session.get("agent") or not session.get("value"):
         return False
-    registry = load_registry()
-    pane_id = pane["pane_id"]
-    registry[pane_id] = {
-        "agent": session["agent"],
-        "kind": session.get("kind"),
-        "value": session["value"],
-        "source": session.get("source"),
-        "updated_at": int(time.time()),
-    }
-    save_registry(registry)
+    now = time.time()
+    with registry_lock():
+        registry = load_registry()
+        registry[pane_id] = {
+            "agent": session["agent"],
+            "kind": session.get("kind"),
+            "value": session["value"],
+            "source": session.get("source"),
+            "updated_at": int(now),
+            "alive_at": now,
+        }
+        save_registry(registry)
     return True
+
+
+def forget_session(pane_id):
+    with registry_lock():
+        registry = load_registry()
+        if registry.pop(pane_id, None) is not None:
+            save_registry(registry)
+
+
+def server_started_at():
+    """When the running herdr server started, or None if unknown.
+
+    The server binds its socket at startup, so the socket's mtime is the
+    server's start time (socket I/O never touches it).
+    """
+    path = os.environ.get("HERDR_SOCKET_PATH") or str(Path.home() / ".config" / "herdr" / "herdr.sock")
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def resumable(entry):
+    """True if the agent died with a previous server, not inside this one.
+
+    An agent last seen alive before this server started was killed by the
+    server going down: resume it. One seen alive after was quit (or crashed)
+    by the user in a live server: leave the pane alone.
+    """
+    started = server_started_at()
+    if not entry or started is None:
+        return False
+    return float(entry.get("alive_at", 0)) < started
+
+
+def server_up():
+    return invoke(["pane", "list"]) is not None
 
 
 # --------------------------------------------------------------------------
@@ -744,7 +806,7 @@ def recreate_pane(pane_id, config):
     return None
 
 def run_monitor(pane_id, config):
-    """Detached per-pane watchdog: relaunch the agent whenever it's dead.
+    """Detached per-pane watchdog: resume an agent the server restart killed.
 
     Spawned detached (start_new_session), so no os.setsid() here. This is the
     SINGLE relauncher for its pane — hooks only spawn it, never relaunch.
@@ -756,6 +818,7 @@ def run_monitor(pane_id, config):
     pane_missing_since = None
     first_seen = None
     saw_alive = False
+    dead_since = None
     log(f"monitor started pane={pane_id} pid={os.getpid()}")
 
     while True:
@@ -793,15 +856,25 @@ def run_monitor(pane_id, config):
             if pane_missing_since is None:
                 pane_missing_since = now
             elif now - pane_missing_since > config["pane_gone_grace_seconds"]:
+                if not resumable(load_registry().get(pane_id)):
+                    if server_up():
+                        # Closed (or its agent quit) in this live server.
+                        log(f"monitor pane={pane_id} closed in this server — not recreating")
+                        forget_session(pane_id)
+                        break
+                    # Server down: wait; once it is back the entry is resumable.
+                    time.sleep(config["poll_seconds"])
+                    continue
                 log(f"monitor pane={pane_id} gone {now - pane_missing_since:.0f}s — recreating pane")
                 new_pane = recreate_pane(pane_id, config)
                 if new_pane:
-                    registry = load_registry()
-                    entry = registry.pop(pane_id, None)
-                    if entry:
-                        entry["updated_at"] = int(time.time())
-                        registry[new_pane] = entry
-                        save_registry(registry)
+                    with registry_lock():
+                        registry = load_registry()
+                        entry = registry.pop(pane_id, None)
+                        if entry:
+                            entry["updated_at"] = int(time.time())
+                            registry[new_pane] = entry
+                            save_registry(registry)
                     log(f"monitor recreated pane {pane_id} -> {new_pane}")
                     cleanup_monitor(pane_id)
                     pane_id = new_pane
@@ -846,16 +919,26 @@ def run_monitor(pane_id, config):
         # elsewhere-guard silently failed open on every overridden host.
         _session = pane.get("agent_session") or registry.get(pane_id, {})
         _agent = _session.get("agent") or pane.get("agent")
-        if (
-            argv
-            and now >= ready_at
-            and now - last_relaunch >= config["cooldown_seconds"]
-            and not pane_has_running_process(pane_id)
-            and not session_running_elsewhere(_resume_value, pane_id, _agent)
-        ):
-            log(f"relaunch pane={pane_id} status={status} agent={pane.get('agent')} argv={' '.join(argv)}")
-            pane_run(pane_id, argv)
-            last_relaunch = now
+        dead = argv and now >= ready_at and not pane_has_running_process(pane_id)
+        if not dead:
+            dead_since = None
+        elif resumable(registry.get(pane_id)):
+            if (
+                now - last_relaunch >= config["cooldown_seconds"]
+                and not session_running_elsewhere(_resume_value, pane_id, _agent)
+            ):
+                log(f"relaunch pane={pane_id} status={status} agent={pane.get('agent')} argv={' '.join(argv)}")
+                pane_run(pane_id, argv)
+                last_relaunch = now
+        else:
+            # Died inside this server: the user quit it. Confirm over a few
+            # polls (a server shutdown also kills agents first) and stand down.
+            if dead_since is None:
+                dead_since = now
+            elif now - dead_since >= config["quit_confirm_seconds"] and server_up():
+                log(f"agent quit pane={pane_id} (was alive in this server) — not resuming")
+                forget_session(pane_id)
+                break
 
         touch_lock(pane_id, now)
         time.sleep(config["poll_seconds"])

@@ -25,6 +25,18 @@ mechanism for a dead agent in a live server. This plugin is that mechanism:
   still exists, else the first live workspace, else a brand-new workspace — and
   resumes the agent into it. A reaped pane is recreated instead of abandoned.
 
+## Fork changes
+
+* **Quit means quit.** Only agents killed by a server going down are resumed.
+  An agent the user quits (or that crashes) inside a running server is left
+  alone, and a pane closed in a running server is not recreated. The registry
+  records when each agent was last seen alive (`alive_at`); the server's start
+  time is the mtime of its socket (`HERDR_SOCKET_PATH`). Tune the confirmation
+  window with `quit_confirm_seconds` (default 10).
+* **Latest claude session.** The live `sessionId` in
+  `~/.claude/sessions/<pid>.json` is preferred over the argv `--resume <uuid>`,
+  so `/clear`, `/resume` and plain `claude` launches are tracked.
+
 ## Install
 
 From the marketplace:
